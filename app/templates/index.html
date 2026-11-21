@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Parquet 排序契约核查台</title>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --line: #334155; --text: #e2e8f0;
+    --muted: #94a3b8; --ok: #16a34a; --bad: #dc2626; --warn: #d97706;
+    --accent: #2563eb; --chip: #0b1220;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); line-height: 1.55;
+  }
+  header { padding: 24px 32px 8px; }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; }
+  main { padding: 16px 32px 48px; max-width: 1180px; margin: 0 auto; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 20px; margin-bottom: 18px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; color: #cbd5e1; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 4px; }
+  input[type=file], select, button, input[type=text] {
+    background: var(--chip); color: var(--text); border: 1px solid var(--line);
+    border-radius: 7px; padding: 8px 10px; font-size: 13px;
+  }
+  button { cursor: pointer; background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.secondary { background: var(--chip); border-color: var(--line); }
+  .rule-line { display: grid; grid-template-columns: 32px 1fr 130px 170px; gap: 10px; align-items: end; margin-bottom: 10px; }
+  .rule-line .idx { color: var(--muted); padding-bottom: 9px; font-variant-numeric: tabular-nums; }
+  .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .meta-item { background: var(--chip); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .meta-item .k { font-size: 12px; color: var(--muted); }
+  .meta-item .v { font-size: 18px; font-weight: 600; margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: left; vertical-align: top; }
+  th { background: var(--chip); color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; }
+  .badge.pass { background: rgba(22,163,74,.18); color: #4ade80; border: 1px solid var(--ok); }
+  .badge.violation { background: rgba(220,38,38,.18); color: #f87171; border: 1px solid var(--bad); }
+  .badge.error { background: rgba(217,119,6,.18); color: #fbbf24; border: 1px solid var(--warn); }
+  .badge.unsupported { background: rgba(217,119,6,.18); color: #fbbf24; border: 1px solid var(--warn); }
+  .badge.supported { background: rgba(22,163,74,.15); color: #86efac; border: 1px solid var(--ok); }
+  .violation-box { border: 1px solid var(--bad); background: rgba(220,38,38,.08); border-radius: 9px; padding: 14px 16px; }
+  .error-box { border: 1px solid var(--warn); background: rgba(217,119,6,.08); border-radius: 9px; padding: 14px 16px; }
+  .kv { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; word-break: break-all; }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .spinner { display: none; margin-left: 8px; }
+  .spinner.on { display: inline-block; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } .rule-line { grid-template-columns: 24px 1fr; } }
+  code { background: var(--chip); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Parquet 排序契约核查台</h1>
+  <p>上传含多个 row group 的 Parquet 文件，按原文件行序流式核对全局字典序（跨 row group 比较边界），返回首个违反顺序的相邻两行。相同键允许，保留原行序。上传上限 {{ max_mib }} MiB。</p>
+</header>
+<main>
+  <section class="panel">
+    <h2>1. 选择文件并读取结构</h2>
+    <div class="row">
+      <div>
+        <label for="file">Parquet 文件</label>
+        <input type="file" id="file" accept=".parquet" />
+      </div>
+      <div style="align-self:end">
+        <button id="btn-inspect" disabled>读取结构</button>
+        <span class="spinner" id="spin-inspect">⏳</span>
+      </div>
+    </div>
+    <div id="file-meta" style="margin-top:14px; display:none;">
+      <div class="meta-grid" id="meta-grid"></div>
+    </div>
+  </section>
+
+  <section class="panel" id="rule-panel" style="display:none;">
+    <h2>2. 提交排序规则（1～3 列，按优先级从上到下构成字典序）</h2>
+    <div id="rules"></div>
+    <div class="row">
+      <button id="btn-add" class="secondary">＋ 添加排序列</button>
+      <button id="btn-remove" class="secondary">－ 移除末列</button>
+      <button id="btn-check">开始核查</button>
+      <span class="spinner" id="spin-check">⏳</span>
+    </div>
+    <p class="hint">NULLS FIRST / LAST 与 ASC / DESC 正交；浮点 NaN 约定为大于所有非 NaN 值（同 Spark 排序约定）。</p>
+  </section>
+
+  <section id="result"></section>
+</main>
+
+<script>
+const MAX_RULES = 3;
+let schema = null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]
+));
+
+$("file").addEventListener("change", () => {
+  $("btn-inspect").disabled = !$("file").files.length;
+  $("rule-panel").style.display = "none";
+  $("result").innerHTML = "";
+  schema = null;
+});
+
+$("btn-inspect").addEventListener("click", async () => {
+  const fd = new FormData();
+  fd.append("file", $("file").files[0]);
+  $("spin-inspect").classList.add("on");
+  try {
+    const resp = await fetch("/api/inspect", { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok) { renderError(data); return; }
+    schema = data;
+    renderMeta(data);
+    buildRuleLines(1);
+    $("rule-panel").style.display = "block";
+  } catch (e) {
+    renderError({ error_code: "network", error_message: String(e) });
+  } finally {
+    $("spin-inspect").classList.remove("on");
+  }
+});
+
+function renderMeta(d) {
+  $("file-meta").style.display = "block";
+  const items = [
+    ["文件", esc(d.file_name)],
+    ["总行数", d.num_rows],
+    ["Row Group 数", d.num_row_groups],
+    ["列数", d.num_columns],
+  ];
+  $("meta-grid").innerHTML = items.map(([k, v]) =>
+    `<div class="meta-item"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+}
+
+function columnOptions(selected) {
+  return schema.columns.map(c =>
+    `<option value="${esc(c.name)}" ${c.name === selected ? "selected" : ""}>${esc(c.name)}（${esc(c.arrow_type)}${c.supported ? "" : " · 不支持"}）</option>`
+  ).join("");
+}
+
+function buildRuleLines(n) {
+  const box = $("rules");
+  box.innerHTML = "";
+  for (let i = 0; i < n; i++) box.appendChild(makeRuleLine(i));
+  syncButtons();
+}
+
+function makeRuleLine(i) {
+  const div = document.createElement("div");
+  div.className = "rule-line";
+  div.innerHTML = `
+    <div class="idx">#${i + 1}</div>
+    <div><label>排序列</label><select class="r-col">${columnOptions()}</select></div>
+    <div><label>方向</label>
+      <select class="r-dir"><option>ASC</option><option>DESC</option></select></div>
+    <div><label>NULL 规则</label>
+      <select class="r-nulls"><option>NULLS FIRST</option><option>NULLS LAST</option></select></div>`;
+  return div;
+}
+
+function syncButtons() {
+  const n = $("rules").children.length;
+  $("btn-add").disabled = n >= MAX_RULES;
+  $("btn-remove").disabled = n <= 1;
+}
+
+$("btn-add").addEventListener("click", () => {
+  if ($("rules").children.length >= MAX_RULES) return;
+  const i = $("rules").children.length;
+  $("rules").appendChild(makeRuleLine(i));
+  syncButtons();
+});
+$("btn-remove").addEventListener("click", () => {
+  const box = $("rules");
+  if (box.children.length > 1) box.lastElementChild.remove();
+  syncButtons();
+});
+
+$("btn-check").addEventListener("click", async () => {
+  const rules = [...$("rules").children].map(line => ({
+    column: line.querySelector(".r-col").value,
+    direction: line.querySelector(".r-dir").value,
+    nulls: line.querySelector(".r-nulls").value,
+  }));
+  const fd = new FormData();
+  fd.append("file", $("file").files[0]);
+  fd.append("rules", JSON.stringify({ rules }));
+  $("spin-check").classList.add("on");
+  try {
+    const resp = await fetch("/api/check", { method: "POST", body: fd });
+    const data = await resp.json();
+    renderResult(data);
+  } catch (e) {
+    renderError({ error_code: "network", error_message: String(e) });
+  } finally {
+    $("spin-check").classList.remove("on");
+  }
+});
+
+function fmt(v) {
+  if (v === null || v === undefined) return "<span class='muted'>NULL</span>";
+  if (typeof v === "object" && v.binary_hex) return `0x${esc(v.binary_hex)}`;
+  return esc(typeof v === "object" ? JSON.stringify(v) : v);
+}
+function keyHtml(key) {
+  return (key || []).map(fmt).join(" , ");
+}
+
+function renderError(d) {
+  $("result").innerHTML = `
+    <section class="panel error-box">
+      <h2 style="margin-top:0;">❌ 无法给出通过结论</h2>
+      <p><span class="badge error">${esc(d.error_code || "error")}</span></p>
+      <p class="kv">${esc(d.error_message || "未知错误")}</p>
+      <p class="muted">读取失败、列类型不支持或无法按规则比较时，系统不会提供通过结论。</p>
+    </section>`;
+}
+
+function renderResult(d) {
+  if (d.status === "error") { renderError(d); renderSummaries(d, true); return; }
+  const badge = d.status === "pass"
+    ? `<span class="badge pass">✔ 通过 PASS</span>`
+    : `<span class="badge violation">✘ 违反 VIOLATION</span>`;
+  let html = `
+    <section class="panel">
+      <h2 style="margin-top:0;">核查结论 ${badge}</h2>
+      <p class="muted">文件 <b>${esc(d.file_name)}</b> · 总行数 ${d.total_rows} ·
+      row group ${d.num_row_groups} 个 · 每批 ${d.batch_size} 行流式读取</p>
+      <p class="muted">规则：${d.rules.map(r =>
+        `<code>${esc(r.column)} ${r.direction} ${r.nulls}</code>`).join(" &nbsp; ")}</p>
+      ${d.nan_note ? `<p class="hint">${esc(d.nan_note)}</p>` : ""}
+    </section>`;
+  if (d.status === "violation" && d.violation) html += renderViolation(d.violation);
+  html += renderSummariesHtml(d);
+  $("result").innerHTML = html;
+}
+
+function renderViolation(v) {
+  return `
+    <section class="panel violation-box">
+      <h2 style="margin-top:0;">首个违反顺序的相邻两行</h2>
+      <p class="kv" style="color:#fca5a5;">${esc(v.reason)}</p>
+      <table>
+        <tr><th>位置</th><th>Row Group（序号）</th><th class="num">原文件行号</th><th>键值（字典序）</th></tr>
+        <tr>
+          <td>上一行</td>
+          <td>RG #${v.prev.row_group_id} <span class="muted">(index ${v.prev.row_group_index})</span></td>
+          <td class="num">${v.prev.file_row}</td>
+          <td class="kv">${keyHtml(v.prev.key)}</td>
+        </tr>
+        <tr>
+          <td>当前行</td>
+          <td>RG #${v.curr.row_group_id} <span class="muted">(index ${v.curr.row_group_index})</span></td>
+          <td class="num">${v.curr.file_row}</td>
+          <td class="kv">${keyHtml(v.curr.key)}</td>
+        </tr>
+      </table>
+      <p class="hint">若两行位于不同 row group，则为跨 row group 边界违反；行号从 1 开始，与原文件物理行序一致。</p>
+    </section>`;
+}
+
+function renderSummariesHtml(d) {
+  if (!d.row_group_summaries || !d.row_group_summaries.length) return "";
+  const rgRows = d.row_group_summaries.map(s => `
+    <tr>
+      <td class="num">${s.row_group_id}</td>
+      <td class="num">${s.row_count}</td>
+      <td class="num">${s.first_file_row ?? "—"}</td>
+      <td class="num">${s.last_file_row ?? "—"}</td>
+      <td class="kv">${keyHtml(s.min_key)}</td>
+      <td class="kv">${keyHtml(s.max_key)}</td>
+    </tr>`).join("");
+  const colHead = d.rules.map(r => `<th>${esc(r.column)}</th>`).join("");
+  const colRows = d.row_group_summaries.map(s => {
+    const cells = s.columns.map(c => `
+      <td>
+        <div class="muted">type: ${esc(c.arrow_type)} · NULL: ${c.null_count}</div>
+        <div class="kv">min: ${fmt(c.min_value)}</div>
+        <div class="kv">max: ${fmt(c.max_value)}</div>
+      </td>`).join("");
+    return `<tr><td class="num">${s.row_group_id}</td>${cells}</tr>`;
+  }).join("");
+  return `
+    <section class="panel">
+      <h2>每组键范围摘要</h2>
+      <table>
+        <tr><th class="num">RG</th><th class="num">行数</th><th class="num">首行号</th><th class="num">末行号</th>
+          <th>最小复合键</th><th>最大复合键</th></tr>
+        ${rgRows}
+      </table>
+      <p class="hint">复合键 min/max 按提交的 ASC/DESC、NULLS FIRST/LAST 规则定义。</p>
+      <h2 style="margin-top:18px;">单列范围明细</h2>
+      <table>
+        <tr><th class="num">RG</th>${colHead}</tr>${colRows}
+      </table>
+    </section>`;
+}
+</script>
+</body>
+</html>
